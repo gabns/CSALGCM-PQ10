@@ -10,6 +10,47 @@ T02 - Edit distance (Dynamic Programming)
 Recurrence: D[i][j] = min(D[i-1][j]+1, D[i][j-1]+1, D[i-1][j-1] + (a[i-1]!=b[j-1]))
 """
 
+_VOWEL_SWAPS = {("o", "u"), ("u", "o"), ("e", "i"), ("i", "e")}
+_PHONETIC_SWAPS = {("p", "f"), ("f", "p"), ("b", "v"), ("v", "b"), ("k", "c"), ("c", "k"), ("s", "z"), ("z", "s")}
+
+def filipino_weighted_dist(a, b, max_cost=2.0):
+    """
+    DP plausibility distance for Filipino/Taglish.
+    Returns float cost; returns > max_cost early if implausible.
+    """
+    if a == b:
+        return 0.0
+    n, m = len(a), len(b)
+    prev = [float(j) for j in range(m + 1)]
+
+    for i in range(1, n + 1):
+        ai = a[i - 1]
+        cur = [float(i)] + [0.0] * m
+        row_min = cur[0]
+        for j in range(1, m + 1):
+            bj = b[j - 1]
+            # Substitution cost
+            if ai == bj:
+                sub_cost = 0.0
+            elif (ai, bj) in _VOWEL_SWAPS:
+                sub_cost = 0.25          # politiko <-> pulitiko, lalake <-> lalaki
+            elif (ai, bj) in _PHONETIC_SWAPS:
+                sub_cost = 0.35          # pamilya <-> familya, kwento <-> cuento
+            else:
+                sub_cost = 1.5           # heavy penalty for distinct root consonants (bata vs. pato)
+
+            # Deletion / Insertion cost (cheap if repeating adjacent char or dropping internal vowel)
+            del_cost = 0.2 if (i > 1 and ai == a[i - 2]) or (1 < i < n and ai in "aeiou") else 1.0
+            ins_cost = 0.2 if (j > 1 and bj == b[j - 2]) or (1 < j < m and bj in "aeiou") else 1.0
+
+            v = min(prev[j] + del_cost, cur[j - 1] + ins_cost, prev[j - 1] + sub_cost)
+            cur[j] = v
+            if v < row_min:
+                row_min = v
+        if row_min > max_cost:
+            return max_cost + 1.0
+        prev = cur
+    return prev[m]
 
 def lev_full(a, b):
     n, m = len(a), len(b)

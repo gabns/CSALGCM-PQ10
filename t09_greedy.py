@@ -44,7 +44,7 @@ def top_k(iterable, k, key=lambda x: x):
         item = (key(x), -n, x)
         if len(heap) < k:
             heapq.heappush(heap, item)
-        elif heap and item > heap[0]:         # heap stays empty when k <= 0
+        elif item > heap[0]:
             heapq.heapreplace(heap, item)
     return [x for _, _, x in sorted(heap, reverse=True)]
 
