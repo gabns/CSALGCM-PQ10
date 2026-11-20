@@ -3,46 +3,48 @@ T10 - End-to-end pipeline  ->  Variants.csv
 Columns: word1, word2, word1_count, word2_count, character_difference
 
   count (t01, parallel D&C) -> prune vocab (greedy) -> candidates (t04 deletion hashing)
-  -> verify (t02 bounded DP) -> optional British/American rule filter
-  -> sort (t05) -> stream-write CSV
+  -> verify (t02 DP alignment: only spelling alternations / o-u, e-i swaps allowed)
+  -> sort (t05) -> context filter (same lexical item = used in similar contexts) -> CSV
 
 Run:  python t10_pipeline_csv.py corpus.txt Variants.csv [max_dist=2] [min_count=5]
 Needs t01, t02, t04, t05 in the same folder.
 """
-import csv, re, sys
-from t01_counting import count_file_parallel
-from t02_levenshtein_dp import lev_two_row, filipino_weighted_dist
-from t04_candidate_generation import prune_vocab, hybrid_candidate_pairs, filipino_skeleton, squeeze_repeats
+import csv, math, re, sys
+from collections import Counter
+from t01_counting import count_file_parallel, tokenize
+from t02_levenshtein_dp import lev_two_row, lev_ops
+from t04_candidate_generation import prune_vocab, hybrid_candidate_pairs
 from t05_merge_sort_dc import merge_sort_iter
 
-_INTERNAL_DOUBLE_CONS = re.compile(r"(?<=.)([bcdfghjklmnpqrstvwxyz])\1(?=.)")
+# Spellings that sound the same in Filipino; order matters (ch before c, ph before f)
+_ORTHO = (("ch", "ts"), ("qu", "k"), ("ph", "f"), ("ñ", "ny"), ("x", "ks"), ("v", "b"), ("f", "p"), ("z", "s"))
+_SOFT_C = re.compile(r"c(?=[ei])")
+_VOWEL_SWAPS = {("o", "u"), ("u", "o"), ("e", "i"), ("i", "e")}
+
+
+def spelling_key(w):
+    """Map orthographic alternatives to one form: cuento->kuento, familya->pamilya, señor->senyor."""
+    s = w
+    for old, new in _ORTHO:
+        s = s.replace(old, new)
+    return _SOFT_C.sub("s", s).replace("c", "k")
 
 
 def is_valid_filipino_variant(a, b):
-    la, lb = len(a), len(b)
-    min_len, max_len = min(la, lb), max(la, lb)
-
-    # 1. Block short-word root collisions (e.g., opo vs. upo)
-    if min_len < 4:
+    """
+    Variant only if, after normalising spelling alternatives, every remaining edit
+    (found by DP alignment, t02.lev_ops) is an o/u or e/i vowel swap.
+      politiko/pulitiko -> one o/u swap            -> variant
+      polittico/pulitiko -> extra 't' (deletion)   -> rejected
+      opo/upo, mesa/misa -> too short; short words collide into different lexical items
+      isang/ibang        -> s/b consonant change   -> rejected
+    """
+    if min(len(a), len(b)) < 5:
         return False
-
-    # 2. Block foreign/unmotivated internal double consonants (e.g., polittico vs. pulitiko)
-    if bool(_INTERNAL_DOUBLE_CONS.search(a)) != bool(_INTERNAL_DOUBLE_CONS.search(b)):
-        if squeeze_repeats(a) != squeeze_repeats(b):
-            return False
-
-    # 3. Check weighted Filipino phonetic/orthographic cost
-    if filipino_weighted_dist(a, b, max_cost=1.6) > 1.6:
+    _, ops = lev_ops(spelling_key(a), spelling_key(b))
+    if not all(op[0] == "sub" and (op[1], op[2]) in _VOWEL_SWAPS for op in ops):
         return False
-
-    # 4. Enforce proportional similarity on raw characters
-    raw_dist = lev_two_row(a, b)
-    same_skeleton = (filipino_skeleton(a) == filipino_skeleton(b))
-    max_ratio = 0.50 if same_skeleton else 0.25
-    if (raw_dist / max_len) > max_ratio:
-        return False
-
-    return True, raw_dist
+    return True, lev_two_row(a, b)
 
 
 def find_variants(counts, max_dist=3, min_count=5, ratio=None):
@@ -60,3 +62,59 @@ def find_variants(counts, max_dist=3, min_count=5, ratio=None):
             continue
         out.append((a, b, ca, cb, d))
     return merge_sort_iter(out, key=lambda r: (r[4], -(r[2] + r[3]), r[0]))
+
+
+# Filipino/Taglish alphabet only: drops Arabic/Cyrillic/CJK tokens from the Wikipedia dump
+_LATIN_WORD = re.compile(r"[a-zñ]+(?:'[a-zñ]+)*")
+
+
+def clean_counts(counts):
+    return {w: c for w, c in counts.items() if _LATIN_WORD.fullmatch(w.replace("’", "'"))}
+
+
+def context_filter(rows, path, min_sim=0.05, window=3):
+    """
+    Drop pairs whose words are used in different contexts (romano/rumano, petso/pitso).
+    One streaming pass collects +-window neighbour counts for the pair words only;
+    neighbours are idf-weighted so 'ang', 'ng', 'sa' count for ~nothing; then cosine.
+    shortcut: rare words (count ~5) have sparse contexts, so some true variants
+    (placebo/plasebo) are lost; lower min_sim to trade precision for recall.
+    """
+    ctx = {w: Counter() for r in rows for w in r[:2]}
+    with open(path, "r", encoding="utf-8", errors="ignore", buffering=1 << 20) as f:
+        for line in f:
+            t = tokenize(line)
+            for i, w in enumerate(t):
+                c = ctx.get(w)
+                if c is not None:
+                    c.update(t[max(0, i - window):i])
+                    c.update(t[i + 1:i + 1 + window])
+    df = Counter(k for c in ctx.values() for k in c)
+    n = len(ctx)
+
+    def cosine(a, b):
+        va = {k: v * math.log((n + 1) / df[k]) for k, v in ctx[a].items()}
+        vb = {k: v * math.log((n + 1) / df[k]) for k, v in ctx[b].items()}
+        dot = sum(v * vb.get(k, 0.0) for k, v in va.items())
+        norm = math.sqrt(sum(v * v for v in va.values())) * math.sqrt(sum(v * v for v in vb.values()))
+        return dot / norm if norm else 0.0
+
+    return [r for r in rows if cosine(r[0], r[1]) >= min_sim]
+
+
+def write_csv(rows, path):
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["word1", "word2", "word1_count", "word2_count", "character_difference"])
+        w.writerows(rows)
+
+
+if __name__ == "__main__":                    # needed for multiprocessing on Windows/macOS
+    if len(sys.argv) < 3:
+        sys.exit("usage: python t10_pipeline_csv.py corpus.txt Variants.csv [max_dist=2] [min_count=5]")
+    max_dist = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+    min_count = int(sys.argv[4]) if len(sys.argv) > 4 else 5
+    counts = clean_counts(count_file_parallel(sys.argv[1]))
+    rows = context_filter(find_variants(counts, max_dist=max_dist, min_count=min_count), sys.argv[1])
+    write_csv(rows, sys.argv[2])
+    print(f"{len(counts)} clean words -> {len(rows)} variant pairs -> {sys.argv[2]}")
