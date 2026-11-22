@@ -6,7 +6,12 @@ Columns: word1, word2, word1_count, word2_count, character_difference
   -> verify (t02 DP alignment: only spelling alternations / o-u, e-i swaps allowed)
   -> sort (t05) -> context filter (same lexical item = used in similar contexts) -> CSV
 
-Run:  python t10_pipeline_csv.py corpus.txt Variants.csv [max_dist=2] [min_count=5]
+character_difference is the readable list of edits from t02.lev_ops, word1 -> word2:
+  "o vs. u"  |  "e vs. i"  |  "ph vs. p"  |  "ch vs. ts"  |  "c vs. k; o vs. u"
+Rows are sorted by the letter-level edit distance d (t02.lev_two_row on the raw words;
+a digraph such as "ch vs. ts" is shown as one item but counts as 2 edits), then by total frequency.
+
+Run:  python t10_pipeline_csv.py datasets/Raw.txt Variants.csv [max_dist=2] [min_count=5]
 Needs t01, t02, t04, t05 in the same folder.
 """
 import csv, math, re, sys
@@ -20,6 +25,16 @@ from t05_merge_sort_dc import merge_sort_iter
 _ORTHO = (("ch", "ts"), ("qu", "k"), ("ph", "f"), ("ñ", "ny"), ("x", "ks"), ("v", "b"), ("f", "p"), ("z", "s"))
 _SOFT_C = re.compile(r"c(?=[ei])")
 _VOWEL_SWAPS = {("o", "u"), ("u", "o"), ("e", "i"), ("i", "e")}
+
+# Digraphs are swapped for one placeholder character before alignment so they print as one unit
+_DIGRAPH_TOKENS = (
+    ("ph", "\x01"),
+    ("ch", "\x02"),
+    ("ts", "\x03"),
+    ("qu", "\x04"),
+    ("ny", "\x05"),
+)
+_REV_TOKENS = {tok: dg for dg, tok in _DIGRAPH_TOKENS}
 
 
 def spelling_key(w):
@@ -41,27 +56,54 @@ def is_valid_filipino_variant(a, b):
     """
     if min(len(a), len(b)) < 5:
         return False
-    _, ops = lev_ops(spelling_key(a), spelling_key(b))
-    if not all(op[0] == "sub" and (op[1], op[2]) in _VOWEL_SWAPS for op in ops):
+    ka, kb = spelling_key(a), spelling_key(b)
+    if len(ka) != len(kb):                    # a swap-only alignment needs equal length: skip the DP
         return False
-    return True, lev_two_row(a, b)
+    _, ops = lev_ops(ka, kb)
+    return all(op[0] == "sub" and (op[1], op[2]) in _VOWEL_SWAPS for op in ops)
 
 
-def find_variants(counts, max_dist=3, min_count=5, ratio=None):
+def _pack_digraphs(a, b):
+    """Replace a digraph by one placeholder only where exactly one of the two words has it."""
+    for dg, tok in _DIGRAPH_TOKENS:
+        if dg in a and dg not in b:
+            a = a.replace(dg, tok)
+        if dg in b and dg not in a:
+            b = b.replace(dg, tok)
+    return a, b
+
+
+def character_difference(a, b):
+    """Readable edits a -> b: 'o vs. u', 'ph vs. p', 'f vs. ph', 'c vs. k; o vs. u'."""
+    pa, pb = _pack_digraphs(a, b)
+    parts = []
+    for op in lev_ops(pa, pb)[1]:
+        if op[0] == "sub":
+            x = _REV_TOKENS.get(op[1], op[1])
+            y = _REV_TOKENS.get(op[2], op[2])
+            parts.append(f"{x} vs. {y}")
+        elif op[0] == "ins":
+            parts.append(f"+{_REV_TOKENS.get(op[1], op[1])}")
+        else:
+            parts.append(f"-{_REV_TOKENS.get(op[1], op[1])}")
+    return "; ".join(parts)
+
+
+def find_variants(counts, max_dist=2, min_count=5, ratio=None):
     words = prune_vocab(counts, min_count=min_count)
     out = []
     for a, b in hybrid_candidate_pairs(words):
-        res = is_valid_filipino_variant(a, b)
-        if not res:
-            continue
-        _, d = res
+        d = lev_two_row(a, b)
         if d == 0 or d > max_dist:
+            continue
+        if not is_valid_filipino_variant(a, b):
             continue
         ca, cb = counts[a], counts[b]
         if ratio and min(ca, cb) * ratio < max(ca, cb):
             continue
-        out.append((a, b, ca, cb, d))
-    return merge_sort_iter(out, key=lambda r: (r[4], -(r[2] + r[3]), r[0]))
+        out.append((a, b, ca, cb, character_difference(a, b), d))
+    out = merge_sort_iter(out, key=lambda r: (r[5], -(r[2] + r[3]), r[0]))   # sort by integer d
+    return [r[:5] for r in out]                                              # drop d: CSV has 5 columns
 
 
 # Filipino/Taglish alphabet only: drops Arabic/Cyrillic/CJK tokens from the Wikipedia dump
